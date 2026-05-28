@@ -16,6 +16,11 @@ def _float(name: str, default: float) -> float:
     return float(raw) if raw not in (None, "") else default
 
 
+def _int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    return int(raw) if raw not in (None, "") else default
+
+
 def _bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -25,8 +30,15 @@ def _bool(name: str, default: bool) -> bool:
 
 @dataclass
 class Config:
-    # Exchange (price data only)
+    # Exchange
     exchange_id: str = os.getenv("EXCHANGE_ID", "tokocrypto")
+    exchange_api_key: str = os.getenv("EXCHANGE_API_KEY", "")
+    exchange_secret: str = os.getenv("EXCHANGE_SECRET", "")
+
+    # Trading safety
+    trading_enabled: bool = _bool("TRADING_ENABLED", False)
+    dry_run: bool = _bool("DRY_RUN", True)
+    max_trade_idr: float = _float("MAX_TRADE_IDR", 500000.0)
 
     # Staking positions
     sol_amount: float = _float("STAKING_SOL_AMOUNT", 0.0)
@@ -36,9 +48,22 @@ class Config:
     usdt_amount: float = _float("STAKING_USDT_AMOUNT", 0.0)
     usdt_apy: float = _float("STAKING_USDT_APY", 0.10)
 
-    # Alert thresholds
+    # Auto-compound
+    auto_compound: bool = _bool("AUTO_COMPOUND", True)
+    compound_min_idr: float = _float("COMPOUND_MIN_IDR", 10000.0)
+
+    # DCA
+    dca_enabled: bool = _bool("DCA_ENABLED", True)
     dca_dip_pct: float = _float("DCA_DIP_PCT", 0.05)
+    dca_suggest_min_idr: float = _float("DCA_SUGGEST_MIN", 50000.0)
+    dca_suggest_max_idr: float = _float("DCA_SUGGEST_MAX", 200000.0)
+    dca_auto_buy: bool = _bool("DCA_AUTO_BUY", False)
+
+    # Rebalance
+    rebalance_enabled: bool = _bool("REBALANCE_ENABLED", True)
     rebalance_threshold_pct: float = _float("REBALANCE_THRESHOLD_PCT", 0.10)
+    rebalance_interval_months: int = _int("REBALANCE_INTERVAL_MONTHS", 3)
+    rebalance_auto_execute: bool = _bool("REBALANCE_AUTO_EXECUTE", False)
     target_sol_pct: float = _float("TARGET_SOL_PCT", 0.50)
 
     # Rate

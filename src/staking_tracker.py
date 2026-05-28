@@ -1,13 +1,13 @@
-"""Staking portfolio tracker — rewards, rebalance, DCA alerts."""
+"""Staking portfolio tracker — auto-compound, DCA analysis, rebalance execution."""
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from config import CONFIG
 from src import storage
 from src.price_fetcher import fetch_sol_price
+from src.executor import execute_buy, execute_sell, TradeResult
 
 
 @dataclass
@@ -24,22 +24,29 @@ class PortfolioSnapshot:
     total_yearly_reward_idr: float
 
 
+@dataclass
+class ActionResult:
+    action: str          # compound / dca / rebalance / info
+    emoji: str
+    title: str
+    message: str
+    executed: bool       # True if auto-executed
+    trade_result: TradeResult | None = None
+
+
 def calc_portfolio() -> PortfolioSnapshot:
     """Calculate current portfolio state."""
     sol_price = fetch_sol_price()
 
-    # SOL value: original IDR stake adjusted by price change
     price_change = 0.0
     if CONFIG.sol_entry_price > 0:
         price_change = (sol_price - CONFIG.sol_entry_price) / CONFIG.sol_entry_price
     sol_value = CONFIG.sol_amount * (1 + price_change)
 
-    usdt_value = CONFIG.usdt_amount  # stablecoin = no price change
+    usdt_value = CONFIG.usdt_amount
     total = sol_value + usdt_value
-
     sol_pct = (sol_value / total) if total > 0 else 0
 
-    # Staking rewards
     sol_daily = (CONFIG.sol_amount * CONFIG.sol_apy) / 365
     usdt_daily = (CONFIG.usdt_amount * CONFIG.usdt_apy) / 365
     monthly = (sol_daily + usdt_daily) * 30
@@ -59,101 +66,215 @@ def calc_portfolio() -> PortfolioSnapshot:
     )
 
 
-@dataclass
-class Alert:
-    type: str  # dca, rebalance, reward_reminder
-    emoji: str
-    title: str
-    message: str
-    action: str  # recommended action
+# ──────────────────────────────────────────────
+# 1. AUTO-COMPOUND
+# ──────────────────────────────────────────────
 
+def check_auto_compound(snap: PortfolioSnapshot) -> ActionResult | None:
+    """Estimate accumulated staking rewards and suggest/auto-execute restake.
 
-def check_dca_alert(snap: PortfolioSnapshot) -> Alert | None:
-    """Alert if SOL dropped significantly from entry price (buy the dip)."""
-    if CONFIG.sol_entry_price <= 0:
+    Since Tokocrypto doesn't expose staking API via CCXT, we:
+    - Track rewards in DB (accumulated daily)
+    - When reward > compound_min_idr → suggest restake
+    - If AUTO_COMPOUND=true AND DRY_RUN=false → auto-buy SOL with reward
+    """
+    if not CONFIG.auto_compound:
         return None
 
-    drop_pct = -snap.sol_change_from_entry_pct
-    if drop_pct >= CONFIG.dca_dip_pct:
-        # Suggest DCA amount based on drop severity
-        suggested_idr = min(100_000, CONFIG.sol_amount * 0.2)  # 20% of current, max 100k
-        if drop_pct >= 0.10:
-            suggested_idr = min(200_000, CONFIG.sol_amount * 0.3)
+    # Calculate accumulated reward since last compound
+    positions = storage.get_positions()
+    sol_pos = next((p for p in positions if p["asset"] == "SOL"), None)
+    usdt_pos = next((p for p in positions if p["asset"] == "USDT"), None)
 
-        return Alert(
-            type="dca",
-            emoji="📉",
-            title="SOL TURUN — DCA Opportunity!",
-            message=(
-                f"SOL turun {drop_pct*100:.1f}% dari harga beli kamu!\n"
-                f"Harga beli: ${CONFIG.sol_entry_price:.2f}\n"
-                f"Harga sekarang: ${snap.sol_price_usd:.2f}\n"
-                f"Rekomendasi: tambah DCA ~Rp {suggested_idr:,.0f}"
-            ),
-            action=f"Beli SOL Rp {suggested_idr:,.0f} di Tokocrypto",
-        )
-    return None
+    sol_reward = sol_pos["accumulated_reward_idr"] if sol_pos else 0
+    usdt_reward = usdt_pos["accumulated_reward_idr"] if usdt_pos else 0
+    total_reward = sol_reward + usdt_reward
 
+    if total_reward < CONFIG.compound_min_idr:
+        return None  # Not enough to compound yet
 
-def check_rebalance_alert(snap: PortfolioSnapshot) -> Alert | None:
-    """Alert if portfolio allocation drifted too far from target."""
-    target = CONFIG.target_sol_pct
-    drift = abs(snap.sol_pct - target)
+    # Decide what to do with the reward
+    # Strategy: buy more SOL with the USDT reward portion
+    trade = None
+    executed = False
 
-    if drift >= CONFIG.rebalance_threshold_pct:
-        direction = "kelebihan SOL" if snap.sol_pct > target else "kekurangan SOL"
-        total = snap.total_value_idr
-        ideal_sol = total * target
-        diff = abs(snap.sol_value_idr - ideal_sol)
+    if CONFIG.auto_compound and total_reward >= CONFIG.compound_min_idr:
+        # Auto-buy SOL with accumulated USDT reward
+        trade = execute_buy(usdt_reward)
+        executed = trade.success
 
-        return Alert(
-            type="rebalance",
-            emoji="⚖️",
-            title="Portfolio Imbalanced!",
-            message=(
-                f"SOL: {snap.sol_pct*100:.1f}% (target: {target*100:.0f}%)\n"
-                f"{direction} sekitar Rp {diff:,.0f}\n"
-                f"SOL value: Rp {snap.sol_value_idr:,.0f}\n"
-                f"USDT value: Rp {snap.usdt_value_idr:,.0f}"
-            ),
-            action=f"Rebalance: {'jual' if snap.sol_pct > target else 'beli'} SOL ~Rp {diff:,.0f}",
-        )
-    return None
+        if executed:
+            # Reset accumulated reward in DB
+            if usdt_pos:
+                storage.update_reward("USDT", -usdt_reward)
+            # Update SOL position
+            new_sol_amount = CONFIG.sol_amount + trade.quantity * trade.price * CONFIG.idr_usd
+            CONFIG.sol_amount = new_sol_amount
 
+    msg_lines = [
+        f"Accumulated rewards: Rp {total_reward:,.0f}",
+        f"  SOL staking: Rp {sol_reward:,.0f}",
+        f"  USDT staking: Rp {usdt_reward:,.0f}",
+    ]
+    if executed and trade:
+        msg_lines.append(f"Auto-compound: bought {trade.quantity:.6f} SOL @ ${trade.price:.2f}")
+        msg_lines.append(f"Cost: Rp {usdt_reward:,.0f}")
+    else:
+        msg_lines.append("Suggest: klaim reward & beli SOL manual di Tokocrypto")
 
-def check_reward_reminder(snap: PortfolioSnapshot) -> Alert | None:
-    """Weekly reminder to claim and restake rewards."""
-    now = datetime.now(timezone.utc)
-    # Only fire on Mondays (weekday=0)
-    if now.weekday() != 0:
-        return None
-
-    if storage.was_alert_sent_today("reward_reminder"):
-        return None
-
-    return Alert(
-        type="reward_reminder",
-        emoji="💰",
-        title="Weekly Staking Reward Reminder",
-        message=(
-            f"Estimasi reward minggu ini:\n"
-            f"SOL: ~Rp {snap.sol_daily_reward_idr * 7:,.0f}\n"
-            f"USDT: ~Rp {snap.usdt_daily_reward_idr * 7:,.0f}\n"
-            f"Total: ~Rp {(snap.sol_daily_reward_idr + snap.usdt_daily_reward_idr) * 7:,.0f}\n\n"
-            f"Jangan lupa klaim & restake ya!"
-        ),
-        action="Klaim reward di Tokocrypto Earn, lalu stake ulang",
+    return ActionResult(
+        action="compound",
+        emoji="🔄",
+        title="Auto-Compound Reward",
+        message="\n".join(msg_lines),
+        executed=executed,
+        trade_result=trade,
     )
 
 
-def run_all_checks() -> list[Alert]:
-    """Run all monitoring checks and return active alerts."""
+# ──────────────────────────────────────────────
+# 2. DCA ANALYSIS
+# ──────────────────────────────────────────────
+
+def check_dca(snap: PortfolioSnapshot) -> ActionResult | None:
+    """Analyze SOL price for DCA opportunity.
+
+    Triggers when SOL drops dca_dip_pct% from entry price.
+    Suggests buy amount based on drop severity.
+    Can auto-execute if DCA_AUTO_BUY=true.
+    """
+    if not CONFIG.dca_enabled or CONFIG.sol_entry_price <= 0:
+        return None
+
+    drop_pct = -snap.sol_change_from_entry_pct
+    if drop_pct < CONFIG.dca_dip_pct:
+        return None  # No dip detected
+
+    # Scale suggestion with drop severity
+    if drop_pct >= 0.15:
+        suggested = min(300_000, CONFIG.dca_suggest_max_idr * 1.5)
+        urgency = "TURUN BANGET! 🚨"
+    elif drop_pct >= 0.10:
+        suggested = min(200_000, CONFIG.dca_suggest_max_idr)
+        urgency = "Turun cukup dalam 📉"
+    else:
+        suggested = CONFIG.dca_suggest_min_idr
+        urgency = "Mulai turun 📊"
+
+    trade = None
+    executed = False
+
+    if CONFIG.dca_auto_buy:
+        trade = execute_buy(suggested)
+        executed = trade.success
+        if executed:
+            CONFIG.sol_amount += suggested
+            CONFIG.sol_entry_price = snap.sol_price_usd  # update avg entry
+
+    msg_lines = [
+        f"{urgency}",
+        f"SOL turun {drop_pct*100:.1f}% dari harga beli",
+        f"Entry: ${CONFIG.sol_entry_price:.2f} → Now: ${snap.sol_price_usd:.2f}",
+        "",
+    ]
+    if executed and trade:
+        msg_lines.append(f"Auto-DCA: beli {trade.quantity:.6f} SOL @ ${trade.price:.2f}")
+        msg_lines.append(f"Nominal: Rp {suggested:,.0f}")
+    else:
+        msg_lines.append(f"Rekomendasi: tambah DCA ~Rp {suggested:,.0f}")
+        msg_lines.append(f"beli SOL di Tokocrypto sekarang")
+
+    return ActionResult(
+        action="dca",
+        emoji="📉",
+        title="DCA Opportunity Detected!",
+        message="\n".join(msg_lines),
+        executed=executed,
+        trade_result=trade,
+    )
+
+
+# ──────────────────────────────────────────────
+# 3. REBALANCE
+# ──────────────────────────────────────────────
+
+def check_rebalance(snap: PortfolioSnapshot) -> ActionResult | None:
+    """Check if portfolio needs rebalancing.
+
+    Triggers when allocation drifts > threshold from target.
+    Can auto-execute trades to rebalance.
+    """
+    if not CONFIG.rebalance_enabled:
+        return None
+
+    target = CONFIG.target_sol_pct
+    drift = abs(snap.sol_pct - target)
+    if drift < CONFIG.rebalance_threshold_pct:
+        return None  # Within acceptable range
+
+    # Calculate trade needed
+    total = snap.total_value_idr
+    ideal_sol = total * target
+    diff_idr = snap.sol_value_idr - ideal_sol  # positive = too much SOL
+
+    trade = None
+    executed = False
+
+    if CONFIG.rebalance_auto_execute:
+        if diff_idr > 0:
+            # Too much SOL → sell some
+            sol_to_sell = diff_idr / (snap.sol_price_usd * CONFIG.idr_usd)
+            trade = execute_sell(sol_to_sell)
+            executed = trade.success
+            if executed:
+                CONFIG.sol_amount -= diff_idr
+                CONFIG.usdt_amount += diff_idr
+        else:
+            # Too little SOL → buy some
+            buy_amount = abs(diff_idr)
+            trade = execute_buy(buy_amount)
+            executed = trade.success
+            if executed:
+                CONFIG.sol_amount += buy_amount
+                CONFIG.usdt_amount -= buy_amount
+
+    direction = "jual SOL → USDT" if diff_idr > 0 else "beli SOL ← USDT"
+    msg_lines = [
+        f"Portfolio geser dari target!",
+        f"SOL: {snap.sol_pct*100:.1f}% (target: {target*100:.0f}%)",
+        f"Drift: {drift*100:.1f}%",
+        f"Aksi: {direction} ~Rp {abs(diff_idr):,.0f}",
+        "",
+        f"SOL value: Rp {snap.sol_value_idr:,.0f}",
+        f"USDT value: Rp {snap.usdt_value_idr:,.0f}",
+    ]
+    if executed and trade:
+        msg_lines.append(f"\nAuto-rebalance: {trade.action} {trade.quantity:.6f} SOL @ ${trade.price:.2f}")
+    else:
+        msg_lines.append("\nSuggest: rebalance manual di Tokocrypto")
+
+    return ActionResult(
+        action="rebalance",
+        emoji="⚖️",
+        title="Rebalance Needed!",
+        message="\n".join(msg_lines),
+        executed=executed,
+        trade_result=trade,
+    )
+
+
+# ──────────────────────────────────────────────
+# RUN ALL
+# ──────────────────────────────────────────────
+
+def run_all_checks() -> list[ActionResult]:
+    """Run all monitoring checks, return active results."""
     snap = calc_portfolio()
 
     # Log price
     storage.record_price("SOL/USDT", snap.sol_price_usd, snap.sol_change_from_entry_pct)
 
-    # Update staking positions in DB
+    # Update positions in DB
     storage.upsert_position("SOL", CONFIG.sol_amount, CONFIG.sol_entry_price, CONFIG.sol_apy)
     storage.upsert_position("USDT", CONFIG.usdt_amount, 0, CONFIG.usdt_apy)
 
@@ -161,40 +282,48 @@ def run_all_checks() -> list[Alert]:
     storage.update_reward("SOL", snap.sol_daily_reward_idr)
     storage.update_reward("USDT", snap.usdt_daily_reward_idr)
 
-    alerts = []
-    for checker in [check_dca_alert, check_rebalance_alert, check_reward_reminder]:
-        alert = checker(snap)
-        if alert:
-            alerts.append(alert)
+    results = []
+    for checker in [check_auto_compound, check_dca, check_rebalance]:
+        result = checker(snap)
+        if result:
+            results.append(result)
 
-    return alerts
+    return results
 
 
 def format_portfolio_report(snap: PortfolioSnapshot) -> str:
-    """Format a human-readable portfolio status."""
+    """Human-readable portfolio status."""
     pnl_emoji = "📈" if snap.sol_change_from_entry_pct >= 0 else "📉"
     lines = [
-        f"{'='*40}",
-        f"🏦 STAKING PORTFOLIO REPORT",
-        f"{'='*40}",
-        f"",
+        "=" * 40,
+        "🏦 STAKING PORTFOLIO",
+        "=" * 40,
+        "",
         f"SOL @ ${snap.sol_price_usd:.2f}",
         f"  Entry: ${CONFIG.sol_entry_price:.2f} ({pnl_emoji} {snap.sol_change_from_entry_pct*100:+.1f}%)",
         f"  Staked: Rp {CONFIG.sol_amount:,.0f} → Rp {snap.sol_value_idr:,.0f}",
         f"  APY: {CONFIG.sol_apy*100:.2f}%",
-        f"",
+        "",
         f"USDT",
         f"  Staked: Rp {CONFIG.usdt_amount:,.0f}",
         f"  APY: {CONFIG.usdt_apy*100:.1f}%",
-        f"",
-        f"{'—'*40}",
-        f"Total Value: Rp {snap.total_value_idr:,.0f}",
-        f"Allocation: SOL {snap.sol_pct*100:.1f}% / USDT {(1-snap.sol_pct)*100:.1f}%",
+        "",
+        "—" * 40,
+        f"Total: Rp {snap.total_value_idr:,.0f}",
+        f"Split: SOL {snap.sol_pct*100:.1f}% / USDT {(1-snap.sol_pct)*100:.1f}%",
         f"Target: SOL {CONFIG.target_sol_pct*100:.0f}% / USDT {(1-CONFIG.target_sol_pct)*100:.0f}%",
-        f"",
-        f"💰 REWARDS",
+        "",
+        "💰 REWARDS",
         f"  Daily: Rp {snap.sol_daily_reward_idr + snap.usdt_daily_reward_idr:,.0f}",
         f"  Monthly: Rp {snap.total_monthly_reward_idr:,.0f}",
         f"  Yearly: Rp {snap.total_yearly_reward_idr:,.0f}",
+        "",
+        "⚙️ FEATURES",
+        f"  Auto-compound: {'ON' if CONFIG.auto_compound else 'OFF'}",
+        f"  DCA alerts: {'ON' if CONFIG.dca_enabled else 'OFF'}",
+        f"  Auto DCA buy: {'ON' if CONFIG.dca_auto_buy else 'OFF'}",
+        f"  Rebalance: {'ON' if CONFIG.rebalance_enabled else 'OFF'}",
+        f"  Auto rebalance: {'ON' if CONFIG.rebalance_auto_execute else 'OFF'}",
+        f"  {'🧪 DRY RUN' if CONFIG.dry_run else '🔴 LIVE'}",
     ]
     return "\n".join(lines)
