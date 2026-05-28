@@ -37,3 +37,8 @@ def fetch_price(symbol: str = "SOL/USDT") -> float:
 def fetch_sol_price() -> float:
     """Convenience wrapper for SOL/USDT."""
     return fetch_price("SOL/USDT")
+
+
+def fetch_atom_price() -> float:
+    """Convenience wrapper for ATOM/USDT."""
+    return fetch_price("ATOM/USDT")

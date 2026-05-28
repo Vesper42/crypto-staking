@@ -31,10 +31,10 @@ def init_positions():
     """Seed staking positions from .env config."""
     storage.init_db()
     storage.upsert_position("SOL", CONFIG.sol_amount, CONFIG.sol_entry_price, CONFIG.sol_apy)
-    storage.upsert_position("USDT", CONFIG.usdt_amount, 0, CONFIG.usdt_apy)
+    storage.upsert_position("ATOM", CONFIG.atom_amount, CONFIG.atom_entry_price, CONFIG.atom_apy)
     print(f"Positions initialized:")
     print(f"  SOL: Rp {CONFIG.sol_amount:,.0f} @ ${CONFIG.sol_entry_price:.2f} ({CONFIG.sol_apy*100:.2f}% APY)")
-    print(f"  USDT: Rp {CONFIG.usdt_amount:,.0f} ({CONFIG.usdt_apy*100:.1f}% APY)")
+    print(f"  ATOM: {CONFIG.atom_amount} ATOM @ ${CONFIG.atom_entry_price:.2f} ({CONFIG.atom_apy*100:.2f}% APY)")
     print(f"  DRY_RUN: {CONFIG.dry_run}")
     print(f"  Auto-compound: {CONFIG.auto_compound}")
     print(f"  DCA auto-buy: {CONFIG.dca_auto_buy}")
@@ -66,7 +66,7 @@ def run_check():
     print(f"\nSOL ${snap.sol_price_usd:.2f} | "
           f"Total Rp {snap.total_value_idr:,.0f} | "
           f"SOL {snap.sol_pct*100:.1f}% | "
-          f"Rewards Rp {snap.sol_daily_reward_idr + snap.usdt_daily_reward_idr:,.0f}/day")
+          f"Rewards Rp {snap.sol_daily_reward_idr + snap.atom_daily_reward_idr:,.0f}/day")
 
 
 def run_report():

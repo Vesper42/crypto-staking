@@ -6,20 +6,22 @@ from datetime import datetime, timezone
 
 from config import CONFIG
 from src import storage
-from src.price_fetcher import fetch_sol_price
+from src.price_fetcher import fetch_sol_price, fetch_atom_price
 from src.executor import execute_buy, execute_sell, TradeResult
 
 
 @dataclass
 class PortfolioSnapshot:
     sol_price_usd: float
+    atom_price_usd: float
     sol_value_idr: float
-    usdt_value_idr: float
+    atom_value_idr: float
     total_value_idr: float
     sol_pct: float
     sol_change_from_entry_pct: float
+    atom_change_from_entry_pct: float
     sol_daily_reward_idr: float
-    usdt_daily_reward_idr: float
+    atom_daily_reward_idr: float
     total_monthly_reward_idr: float
     total_yearly_reward_idr: float
 
@@ -37,30 +39,40 @@ class ActionResult:
 def calc_portfolio() -> PortfolioSnapshot:
     """Calculate current portfolio state."""
     sol_price = fetch_sol_price()
+    atom_price = fetch_atom_price()
 
-    price_change = 0.0
+    # SOL value with price change
+    sol_price_change = 0.0
     if CONFIG.sol_entry_price > 0:
-        price_change = (sol_price - CONFIG.sol_entry_price) / CONFIG.sol_entry_price
-    sol_value = CONFIG.sol_amount * (1 + price_change)
+        sol_price_change = (sol_price - CONFIG.sol_entry_price) / CONFIG.sol_entry_price
+    sol_value = CONFIG.sol_amount * sol_price * CONFIG.idr_usd  # coin amount × price × rate
 
-    usdt_value = CONFIG.usdt_amount
-    total = sol_value + usdt_value
+    # ATOM value with price change
+    atom_price_change = 0.0
+    if CONFIG.atom_entry_price > 0:
+        atom_price_change = (atom_price - CONFIG.atom_entry_price) / CONFIG.atom_entry_price
+    atom_value = CONFIG.atom_amount * atom_price * CONFIG.idr_usd  # coin amount × price × rate
+
+    total = sol_value + atom_value
     sol_pct = (sol_value / total) if total > 0 else 0
 
-    sol_daily = (CONFIG.sol_amount * CONFIG.sol_apy) / 365
-    usdt_daily = (CONFIG.usdt_amount * CONFIG.usdt_apy) / 365
-    monthly = (sol_daily + usdt_daily) * 30
-    yearly = (sol_daily + usdt_daily) * 365
+    # Daily rewards in IDR (coin_amount × price × rate × APY / 365)
+    sol_daily = (CONFIG.sol_amount * sol_price * CONFIG.idr_usd * CONFIG.sol_apy) / 365
+    atom_daily = (CONFIG.atom_amount * atom_price * CONFIG.idr_usd * CONFIG.atom_apy) / 365
+    monthly = (sol_daily + atom_daily) * 30
+    yearly = (sol_daily + atom_daily) * 365
 
     return PortfolioSnapshot(
         sol_price_usd=sol_price,
+        atom_price_usd=atom_price,
         sol_value_idr=sol_value,
-        usdt_value_idr=usdt_value,
+        atom_value_idr=atom_value,
         total_value_idr=total,
         sol_pct=sol_pct,
-        sol_change_from_entry_pct=price_change,
+        sol_change_from_entry_pct=sol_price_change,
+        atom_change_from_entry_pct=atom_price_change,
         sol_daily_reward_idr=sol_daily,
-        usdt_daily_reward_idr=usdt_daily,
+        atom_daily_reward_idr=atom_daily,
         total_monthly_reward_idr=monthly,
         total_yearly_reward_idr=yearly,
     )
@@ -84,29 +96,29 @@ def check_auto_compound(snap: PortfolioSnapshot) -> ActionResult | None:
     # Calculate accumulated reward since last compound
     positions = storage.get_positions()
     sol_pos = next((p for p in positions if p["asset"] == "SOL"), None)
-    usdt_pos = next((p for p in positions if p["asset"] == "USDT"), None)
+    atom_pos = next((p for p in positions if p["asset"] == "ATOM"), None)
 
     sol_reward = sol_pos["accumulated_reward_idr"] if sol_pos else 0
-    usdt_reward = usdt_pos["accumulated_reward_idr"] if usdt_pos else 0
-    total_reward = sol_reward + usdt_reward
+    atom_reward = atom_pos["accumulated_reward_idr"] if atom_pos else 0
+    total_reward = sol_reward + atom_reward
 
     if total_reward < CONFIG.compound_min_idr:
         return None  # Not enough to compound yet
 
     # Decide what to do with the reward
-    # Strategy: buy more SOL with the USDT reward portion
+    # Strategy: buy more SOL with the ATOM reward portion
     trade = None
     executed = False
 
     if CONFIG.auto_compound and total_reward >= CONFIG.compound_min_idr:
-        # Auto-buy SOL with accumulated USDT reward
-        trade = execute_buy(usdt_reward)
+        # Auto-buy SOL with accumulated ATOM reward
+        trade = execute_buy(atom_reward)
         executed = trade.success
 
         if executed:
             # Reset accumulated reward in DB
-            if usdt_pos:
-                storage.update_reward("USDT", -usdt_reward)
+            if atom_pos:
+                storage.update_reward("ATOM", -atom_reward)
             # Update SOL position
             new_sol_amount = CONFIG.sol_amount + trade.quantity * trade.price * CONFIG.idr_usd
             CONFIG.sol_amount = new_sol_amount
@@ -114,11 +126,11 @@ def check_auto_compound(snap: PortfolioSnapshot) -> ActionResult | None:
     msg_lines = [
         f"Accumulated rewards: Rp {total_reward:,.0f}",
         f"  SOL staking: Rp {sol_reward:,.0f}",
-        f"  USDT staking: Rp {usdt_reward:,.0f}",
+        f"  ATOM staking: Rp {atom_reward:,.0f}",
     ]
     if executed and trade:
         msg_lines.append(f"Auto-compound: bought {trade.quantity:.6f} SOL @ ${trade.price:.2f}")
-        msg_lines.append(f"Cost: Rp {usdt_reward:,.0f}")
+        msg_lines.append(f"Cost: Rp {atom_reward:,.0f}")
     else:
         msg_lines.append("Suggest: klaim reward & beli SOL manual di Tokocrypto")
 
@@ -228,7 +240,7 @@ def check_rebalance(snap: PortfolioSnapshot) -> ActionResult | None:
             executed = trade.success
             if executed:
                 CONFIG.sol_amount -= diff_idr
-                CONFIG.usdt_amount += diff_idr
+                CONFIG.atom_amount += diff_idr
         else:
             # Too little SOL → buy some
             buy_amount = abs(diff_idr)
@@ -236,9 +248,9 @@ def check_rebalance(snap: PortfolioSnapshot) -> ActionResult | None:
             executed = trade.success
             if executed:
                 CONFIG.sol_amount += buy_amount
-                CONFIG.usdt_amount -= buy_amount
+                CONFIG.atom_amount -= buy_amount
 
-    direction = "jual SOL → USDT" if diff_idr > 0 else "beli SOL ← USDT"
+    direction = "jual SOL → ATOM" if diff_idr > 0 else "beli SOL ← ATOM"
     msg_lines = [
         f"Portfolio geser dari target!",
         f"SOL: {snap.sol_pct*100:.1f}% (target: {target*100:.0f}%)",
@@ -246,7 +258,7 @@ def check_rebalance(snap: PortfolioSnapshot) -> ActionResult | None:
         f"Aksi: {direction} ~Rp {abs(diff_idr):,.0f}",
         "",
         f"SOL value: Rp {snap.sol_value_idr:,.0f}",
-        f"USDT value: Rp {snap.usdt_value_idr:,.0f}",
+        f"ATOM value: Rp {snap.atom_value_idr:,.0f}",
     ]
     if executed and trade:
         msg_lines.append(f"\nAuto-rebalance: {trade.action} {trade.quantity:.6f} SOL @ ${trade.price:.2f}")
@@ -276,11 +288,11 @@ def run_all_checks() -> list[ActionResult]:
 
     # Update positions in DB
     storage.upsert_position("SOL", CONFIG.sol_amount, CONFIG.sol_entry_price, CONFIG.sol_apy)
-    storage.upsert_position("USDT", CONFIG.usdt_amount, 0, CONFIG.usdt_apy)
+    storage.upsert_position("ATOM", CONFIG.atom_amount, CONFIG.atom_entry_price, CONFIG.atom_apy)
 
     # Accumulate daily rewards
     storage.update_reward("SOL", snap.sol_daily_reward_idr)
-    storage.update_reward("USDT", snap.usdt_daily_reward_idr)
+    storage.update_reward("ATOM", snap.atom_daily_reward_idr)
 
     results = []
     for checker in [check_auto_compound, check_dca, check_rebalance]:
@@ -293,28 +305,30 @@ def run_all_checks() -> list[ActionResult]:
 
 def format_portfolio_report(snap: PortfolioSnapshot) -> str:
     """Human-readable portfolio status."""
-    pnl_emoji = "📈" if snap.sol_change_from_entry_pct >= 0 else "📉"
+    sol_pnl_emoji = "📈" if snap.sol_change_from_entry_pct >= 0 else "📉"
+    atom_pnl_emoji = "📈" if snap.atom_change_from_entry_pct >= 0 else "📉"
     lines = [
         "=" * 40,
         "🏦 STAKING PORTFOLIO",
         "=" * 40,
         "",
         f"SOL @ ${snap.sol_price_usd:.2f}",
-        f"  Entry: ${CONFIG.sol_entry_price:.2f} ({pnl_emoji} {snap.sol_change_from_entry_pct*100:+.1f}%)",
-        f"  Staked: Rp {CONFIG.sol_amount:,.0f} → Rp {snap.sol_value_idr:,.0f}",
+        f"  Entry: ${CONFIG.sol_entry_price:.2f} ({sol_pnl_emoji} {snap.sol_change_from_entry_pct*100:+.1f}%)",
+        f"  Staked: {CONFIG.sol_amount} SOL → Rp {snap.sol_value_idr:,.0f}",
         f"  APY: {CONFIG.sol_apy*100:.2f}%",
         "",
-        f"USDT",
-        f"  Staked: Rp {CONFIG.usdt_amount:,.0f}",
-        f"  APY: {CONFIG.usdt_apy*100:.1f}%",
+        f"ATOM @ ${snap.atom_price_usd:.2f}",
+        f"  Entry: ${CONFIG.atom_entry_price:.2f} ({atom_pnl_emoji} {snap.atom_change_from_entry_pct*100:+.1f}%)",
+        f"  Staked: {CONFIG.atom_amount} ATOM → Rp {snap.atom_value_idr:,.0f}",
+        f"  APY: {CONFIG.atom_apy*100:.2f}%",
         "",
         "—" * 40,
         f"Total: Rp {snap.total_value_idr:,.0f}",
-        f"Split: SOL {snap.sol_pct*100:.1f}% / USDT {(1-snap.sol_pct)*100:.1f}%",
-        f"Target: SOL {CONFIG.target_sol_pct*100:.0f}% / USDT {(1-CONFIG.target_sol_pct)*100:.0f}%",
+        f"Split: SOL {snap.sol_pct*100:.1f}% / ATOM {(1-snap.sol_pct)*100:.1f}%",
+        f"Target: SOL {CONFIG.target_sol_pct*100:.0f}% / ATOM {(1-CONFIG.target_sol_pct)*100:.0f}%",
         "",
         "💰 REWARDS",
-        f"  Daily: Rp {snap.sol_daily_reward_idr + snap.usdt_daily_reward_idr:,.0f}",
+        f"  Daily: Rp {snap.sol_daily_reward_idr + snap.atom_daily_reward_idr:,.0f}",
         f"  Monthly: Rp {snap.total_monthly_reward_idr:,.0f}",
         f"  Yearly: Rp {snap.total_yearly_reward_idr:,.0f}",
         "",

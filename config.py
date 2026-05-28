@@ -43,10 +43,11 @@ class Config:
     # Staking positions
     sol_amount: float = _float("STAKING_SOL_AMOUNT", 0.0)
     sol_entry_price: float = _float("STAKING_SOL_ENTRY_PRICE", 0.0)
-    sol_apy: float = _float("STAKING_SOL_APY", 0.0571)
+    sol_apy: float = _float("STAKING_SOL_APY", 0.0495)
 
-    usdt_amount: float = _float("STAKING_USDT_AMOUNT", 0.0)
-    usdt_apy: float = _float("STAKING_USDT_APY", 0.10)
+    atom_amount: float = _float("STAKING_ATOM_AMOUNT", 0.0)
+    atom_entry_price: float = _float("STAKING_ATOM_ENTRY_PRICE", 0.0)
+    atom_apy: float = _float("STAKING_ATOM_APY", 0.1125)
 
     # Auto-compound
     auto_compound: bool = _bool("AUTO_COMPOUND", True)
@@ -64,7 +65,7 @@ class Config:
     rebalance_threshold_pct: float = _float("REBALANCE_THRESHOLD_PCT", 0.10)
     rebalance_interval_months: int = _int("REBALANCE_INTERVAL_MONTHS", 3)
     rebalance_auto_execute: bool = _bool("REBALANCE_AUTO_EXECUTE", False)
-    target_sol_pct: float = _float("TARGET_SOL_PCT", 0.50)
+    target_sol_pct: float = _float("TARGET_SOL_PCT", 0.40)
 
     # Rate
     idr_usd: float = _float("IDR_USD_RATE", 16500.0)
